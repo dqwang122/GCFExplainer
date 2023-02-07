@@ -131,6 +131,7 @@ class AIDS(Dataset):
 
         count = 0
         for i, graph in enumerate(graphs):
+            # only keep those do not have more than atoms_to_keep
             if graph.x.sum() == graph.x[:, atoms_to_keep].sum():
                 # Create data
                 x = graph.x[:, atoms_to_keep]
@@ -300,7 +301,7 @@ class PROTEINS(Dataset):
 
         # Delete TUDataset.
         del i, graph, graphs
-        shutil.rmtree(os.path.join(self.root, 'tudataset'))
+        # shutil.rmtree(os.path.join(self.root, 'tudataset'))
 
     def len(self):
         return self.graph_count

@@ -119,7 +119,19 @@ def load_trained_gnn(dataset_name, device):
         dim=20,
         dropout=0.0
     ).to(device)
-    model.load_state_dict(torch.load(f'data/{dataset_name}/gnn/model_best.pth', map_location=device))
+    model_dict = torch.load(f'data/{dataset_name}/gnn/model_best.pth', map_location=device)
+
+    name_change = []
+    change_dict = {}
+    for k, v in model_dict.items():
+        if k.startswith('convs.') and k.endswith('.weight'):
+            name_change.append(k)
+            new_name = k.replace('.weight', '.lin.weight')
+            change_dict[new_name] = v.T
+    for k in name_change:
+        model_dict.pop(k)
+    model_dict.update(change_dict)
+    model.load_state_dict(model_dict)
     return model
 
 
