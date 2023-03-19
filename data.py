@@ -52,6 +52,7 @@ class Mutagenicity(Dataset):
                 # Create data
                 x = graph.x[:, atoms_to_keep]
                 data = Data(edge_index=graph.edge_index.clone(),
+                            edge_attr=torch.argmax(graph.edge_attr, dim=1).clone(),
                             y=torch.tensor(graph.y.item()),  # 0 is mutagenetic, which is undesired for drug discovery.
                             # node_labels=self.label_from_one_hot(x),
                             x=x.clone(),

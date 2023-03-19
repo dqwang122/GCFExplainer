@@ -1,5 +1,6 @@
 import os
 
+import json
 import torch
 import util
 import torch_geometric.utils as torch_utils
@@ -14,6 +15,9 @@ import numpy as np
 from data import load_dataset
 from gnn import load_trained_gnn, load_trained_prediction
 
+VALIDCHECK=True
+ROOT="results/test"
+
 graph_map = {}  # graph_hash -> {edge_index, x}
 graph_index_map = {}  # graph hash -> index in counterfactual_graphs
 counterfactual_candidates = []  # [{frequency: int, graph_hash: str, importance_parts: tuple, input_graphs_covering_indexes: set}]
@@ -25,6 +29,7 @@ MAX_COUNTERFACTUAL_SIZE = 0
 starting_step = 1
 
 traversed_hashes = []  # list of traversed graph hashes
+node_mapping = {}
 
 
 def get_args():
@@ -113,19 +118,23 @@ def edge_change(graph, keep_bridge=True, only_removal=False):
     num_nodes = graph.x.shape[0]
     neighbor_graphs_actions = []
     neighbor_graphs = []
-    for i in range(num_nodes):
-        for j in range(i + 1, num_nodes):
-            if nxg.has_edge(i, j):
-                if keep_bridge and (i, j) not in bridges:  # edge exist and its removal does not disconnect the graph
-                    neighbor_graph_action = ('ER', i, j)
-                else:  # remove edge regardlessly
-                    neighbor_graph_action = ('ERR', i, j)
-                neighbor_graphs_actions.append(neighbor_graph_action)
-                neighbor_graphs.append(neighbor_graph_access(graph, neighbor_graph_action))
-            elif not nxg.has_edge(i, j) and not only_removal:  # add edges
-                neighbor_graph_action = ('EA', i, j)
-                neighbor_graphs_actions.append(neighbor_graph_action)
-                neighbor_graphs.append(neighbor_graph_access(graph, neighbor_graph_action))
+    for idx in range(graph.edge_index.size(-1)):
+        x, y = graph.edge_index[0,idx], graph.edge_index[1,idx]
+        i, j = x.item(), y.item()
+        if keep_bridge and (i, j) not in bridges:  # edge exist and its removal does not disconnect the graph
+            neighbor_graph_action = ('ER', i, j)
+        else:  # remove edge regardlessly
+            neighbor_graph_action = ('ERR', i, j)
+        neighbor_graphs_actions.append(neighbor_graph_action)
+        neighbor_graphs.append(neighbor_graph_access(graph, neighbor_graph_action))
+
+    if not only_removal:
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                if not nxg.has_edge(i, j) and not only_removal:  # add edges
+                    neighbor_graph_action = ('EA', i, j)
+                    neighbor_graphs_actions.append(neighbor_graph_action)
+                    neighbor_graphs.append(neighbor_graph_access(graph, neighbor_graph_action))
     return neighbor_graphs_actions, neighbor_graphs
 
 
@@ -142,6 +151,7 @@ def neighbor_graph_access(graph, neighbor_graph_action):
         _, i, j = neighbor_graph_action
         neighbor_graph.num_nodes += 1
         neighbor_graph.edge_index = torch.hstack([graph.edge_index, torch.tensor([[i, graph.num_nodes], [graph.num_nodes, i]])])  # 14.1 µs ± 57.3 ns per loop, 3 times faster than padder.
+        neighbor_graph.edge_attr = torch.cat([graph.edge_attr, torch.LongTensor([0,0])])
         neighbor_graph.x = torch.vstack([graph.x, torch.nn.functional.one_hot(torch.tensor(j), graph.x.shape[1])])  # 36.8 µs ± 340 ns per loop, similar to padder.
     elif action == 'INA':  # isolated node addition.
         _, i, j = neighbor_graph_action
@@ -156,9 +166,12 @@ def neighbor_graph_access(graph, neighbor_graph_action):
     elif action in ('ER', 'ERR'):  # edge removal (regardlessly)
         _, i, j = neighbor_graph_action
         neighbor_graph.edge_index = graph.edge_index[:, ~((graph.edge_index[0] == i) & (graph.edge_index[1] == j) | (graph.edge_index[0] == j) & (graph.edge_index[1] == i))]  # 78.9 µs ± 1.87 µs per loop
+        x, y = ((graph.edge_index[0] == i) & (graph.edge_index[1] == j)).nonzero(as_tuple=True)[0], ((graph.edge_index[0] == j) & (graph.edge_index[1] == i)).nonzero(as_tuple=True)[0]
+        neighbor_graph.edge_attr = util.th_delete(neighbor_graph.edge_attr, torch.cat((x,y)))
     elif action == 'EA':  # edge addition
         _, i, j = neighbor_graph_action
         neighbor_graph.edge_index = torch.hstack([graph.edge_index, torch.tensor([[i, j], [j, i]])])  # 14 µs ± 262 ns per loop
+        neighbor_graph.edge_attr = torch.cat([graph.edge_attr, torch.LongTensor([0,0])])
     else:
         raise NotImplementedError(f'Neighbor edit action {action} not supported. ')
     return neighbor_graph
@@ -177,6 +190,10 @@ def is_graph_counterfactual(graph_hash):
 
 
 def reorder_counterfactual_candidates(start_idx):
+    """
+        sort the candidates by their frequency, from large to small
+        start_idx: the idx of candidate that just increase its frequency, so the reorder only affect [0, start_idx]
+    """
     swap_idx = start_idx - 1
     while swap_idx >= 0 and counterfactual_candidates[start_idx]['frequency'] > counterfactual_candidates[swap_idx]['frequency']:
         swap_idx -= 1
@@ -195,9 +212,16 @@ def update_input_graphs_covered(add_graph_covering_list=None, remove_graph_cover
     if remove_graph_covering_list is not None:
         input_graphs_covered -= remove_graph_covering_list
 
-
+# TODO: add domain constraint here
 def check_reinforcement_condition(graph_hash):
-    return is_graph_counterfactual(graph_hash)
+    if VALIDCHECK:
+        return is_graph_counterfactual(graph_hash) and domain_check(graph_hash)
+    else:
+        return is_graph_counterfactual(graph_hash)
+
+def domain_check(graph_hash):
+    graph_can = graph_map[graph_hash]
+    return util.valid_checking(graph_can, node_mapping)
 
 
 def populate_counterfactual_candidates(graph_hash, importance_parts, input_graphs_covering_list):
@@ -205,13 +229,16 @@ def populate_counterfactual_candidates(graph_hash, importance_parts, input_graph
     if graph_hash in graph_index_map:
         graph_idx = graph_index_map[graph_hash]
         condition = check_reinforcement_condition(graph_hash)
+        # only that satisfied condition will update the frequency
         if condition:
+            # update the visit to candidate N(v)
             counterfactual_candidates[graph_idx]['frequency'] += 1
             swap_idx = reorder_counterfactual_candidates(graph_idx)
         else:
             swap_idx = graph_idx
     else:
         is_new_graph = True
+        # new graph will be added to counterfactual_candidates anyway
         if is_counterfactual_array_full():
             deleting_graph_hash = counterfactual_candidates[-1]['graph_hash']
             del graph_index_map[deleting_graph_hash]
@@ -226,7 +253,7 @@ def populate_counterfactual_candidates(graph_hash, importance_parts, input_graph
             }
         else:
             counterfactual_candidates.append({
-                'frequency': 2,
+                'frequency': 2,         # each candidate will at least has frequency 2
                 'graph_hash': graph_hash,
                 "importance_parts": importance_parts,
                 "input_graphs_covering_list": input_graphs_covering_list
@@ -237,20 +264,20 @@ def populate_counterfactual_candidates(graph_hash, importance_parts, input_graph
 
     # updating input_graphs_covered entries
     if swap_idx == graph_idx:  # no swap
-        if is_new_graph and graph_idx < len(input_graphs_covered) and is_graph_counterfactual(graph_hash):
+        if is_new_graph and graph_idx < len(input_graphs_covered) and check_reinforcement_condition(graph_hash):
             update_input_graphs_covered(add_graph_covering_list=input_graphs_covering_list)
             covering_graphs.add(graph_hash)
     else:  # swapped graph_idx position has swapped graph now
         swapped_graph = counterfactual_candidates[graph_idx]
-        if is_graph_counterfactual(swapped_graph['graph_hash']) and graph_idx >= len(input_graphs_covered) > swap_idx:
+        if check_reinforcement_condition(swapped_graph['graph_hash']) and graph_idx >= len(input_graphs_covered) > swap_idx:
             update_input_graphs_covered(remove_graph_covering_list=swapped_graph['input_graphs_covering_list'])
             covering_graphs.remove(swapped_graph['graph_hash'])
         if is_new_graph:
-            if is_graph_counterfactual(graph_hash) and swap_idx < len(input_graphs_covered):
+            if check_reinforcement_condition(graph_hash) and swap_idx < len(input_graphs_covered):
                 update_input_graphs_covered(add_graph_covering_list=input_graphs_covering_list)
                 covering_graphs.add(graph_hash)
         else:
-            if is_graph_counterfactual(graph_hash) and swap_idx < len(input_graphs_covered) <= graph_idx:
+            if check_reinforcement_condition(graph_hash) and swap_idx < len(input_graphs_covered) <= graph_idx:
                 update_input_graphs_covered(add_graph_covering_list=input_graphs_covering_list)
                 covering_graphs.add(graph_hash)
 
@@ -399,9 +426,9 @@ def counterfactual_summary_with_randomwalk(input_graphs, importance_args, telepo
         'traversed_hashes': traversed_hashes,
         'input_graphs_covered': input_graphs_covered,
     }
-    if not os.path.exists(f'results/{dataset_name}/runs/'):
-        os.makedirs(f'results/{dataset_name}/runs/')
-    torch.save(save_item, f'results/{dataset_name}/runs/counterfactuals.pt')
+    if not os.path.exists(f'{ROOT}/{dataset_name}/runs/'):
+        os.makedirs(f'{ROOT}/{dataset_name}/runs/')
+    torch.save(save_item, f'{ROOT}/{dataset_name}/runs/counterfactuals.pt')
 
 
 def prepare_devices(device1, device2):
@@ -434,6 +461,10 @@ if __name__ == '__main__':
 
     # Load dataset
     graphs = load_dataset(dataset_name)
+
+    # Load node_mapping
+    mapping_info = json.load(open('data/{}/raw/mapping_info.json'.format(dataset_name)))
+    node_mapping = mapping_info['keep_node_mapping']
 
     # Load GNN model for dataset
     gnn_model = load_trained_gnn(dataset_name, device=device1)

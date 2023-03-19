@@ -1,3 +1,5 @@
+import json
+
 from tqdm import tqdm
 import torch
 
@@ -9,14 +11,16 @@ import distance
 
 import argparse
 
+ROOT="results/test5w"
 
 def parse_args():
     parser = argparse.ArgumentParser(prog='Global Graph Counterfactuals')
 
     # Dataset
-    parser.add_argument('--dataset', help="Dataset flag", type=str, choices=['mutagenicity', 'aids', 'nci1', 'proteins'])
+    parser.add_argument('--dataset', help="Dataset flag", type=str, default='aids', choices=['mutagenicity', 'aids', 'nci1', 'proteins'])
     parser.add_argument('--theta', type=float, default=0.1, help='distance threshold value during evaluation.')
     parser.add_argument('--device', type=str, help='Cuda device or cpu for gnn', default='0', choices=['0', '1', '2', '3', 'cpu'])
+    parser.add_argument('--valid', type=int, help='whether to check the validity of the graph', default=0, choices=[0,1])
 
     return parser.parse_args()
 
@@ -83,6 +87,10 @@ if __name__ == '__main__':
     # Load dataset
     graphs = load_dataset(dataset_name)
 
+    # Load node_mapping
+    mapping_info = json.load(open('data/{}/raw/mapping_info.json'.format(dataset_name)))
+    node_mapping = mapping_info['keep_node_mapping']
+
     # Load GNN model for dataset
     gnn_model = load_trained_gnn(dataset_name, device=device)
     gnn_model.eval()
@@ -96,19 +104,23 @@ if __name__ == '__main__':
 
     original_graphs = graphs[pred_main_idx.tolist()]
 
-    run_path = f'./results/{dataset_name}/runs/counterfactuals.pt'
+    run_path = f'./{ROOT}/{dataset_name}/runs/counterfactuals.pt'
     counterfactual_rw = torch.load(run_path)
     counterfactuals = []
     candidates = counterfactual_rw['counterfactual_candidates']
 
     i = 0
-    while len(counterfactuals) < len(original_graphs) and len(candidates) > i:
+    while len(counterfactuals) < len(original_graphs) and i < len(candidates):
         candidate = candidates[i]
         prediction_importance_value = candidate['importance_parts'][0]
         graph_hash = candidate['graph_hash']
         if prediction_importance_value >= 0.5:
             graph_can = counterfactual_rw['graph_map'][graph_hash]
-            counterfactuals.append(graph_can)
+            if args.valid == 1:
+                if util.valid_checking(graph_can, node_mapping):
+                    counterfactuals.append(graph_can)
+            else:
+                counterfactuals.append(graph_can)
         i += 1
 
     neurosed_model = distance.load_neurosed(original_graphs, neurosed_model_path=f'data/{dataset_name}/neurosed/best_model.pt', device=device)
@@ -151,9 +163,10 @@ if __name__ == '__main__':
         x.append(i)
         y.append(coverings[i][1] / S.shape[0])
 
-    x_axis = range(1, S.shape[0] + 1)
+    x_axis = range(1, S.shape[1] + 1)
     summary_from_coverage = [coverings[idx][0] for idx in coverings]
 
+    # print(S.shape)
     for i in x_axis:
         if i in [1, 5, 10, 25, 50, 100]:
             print(f'Top {i}: {y[i - 1]}')
