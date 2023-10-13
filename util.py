@@ -61,9 +61,13 @@ def MolFromGraphs(Graph, keep_node_mapping):
     return mol
 
 def valid_checking(g, keep_node_mapping):
-    if len(g.edge_attr) == g.edge_index.size(1):
-        m = MolFromGraphs(g, keep_node_mapping)
-        problems = Chem.DetectChemistryProblems(m)
-        if len(problems) == 0:
-            return True
+    try:
+        if len(g.edge_attr) == g.edge_index.size(1):
+            m = MolFromGraphs(g, keep_node_mapping)
+            problems = Chem.DetectChemistryProblems(m)
+            if len(problems) == 0:
+                return True
+    except:
+        print(g.edge_attr)
+        print(g.edge_attr is None)
     return False
